@@ -13,6 +13,7 @@ import (
 	"github.com/notaryproject/notation-go/verifier"
 	"github.com/notaryproject/notation-go/verifier/trustpolicy"
 	"github.com/notaryproject/notation/internal/cmd"
+	"github.com/notaryproject/notation/internal/ioutil"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/spf13/cobra"
@@ -24,6 +25,14 @@ type verifyOpts struct {
 	SecureFlagOpts
 	reference    string
 	pluginConfig []string
+	userMetadata []string
+	outputFormat string
+}
+
+type verifyOutput struct {
+	Reference    string            `json:"reference"`
+	UserMetadata map[string]string `json:"userMetadata,omitempty"`
+	Result       string            `json:"result"`
 }
 
 func verifyCommand(opts *verifyOpts) *cobra.Command {
@@ -50,13 +59,19 @@ Example - Verify a signature on an OCI artifact identified by a tag  (Notation w
 			opts.reference = args[0]
 			return nil
 		},
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runVerify(cmd, opts)
+		RunE: func(cmnd *cobra.Command, args []string) error {
+			if opts.outputFormat != cmd.OutputJson && opts.outputFormat != cmd.OutputPlaintext {
+				return fmt.Errorf("unrecognized output format: %v", opts.outputFormat)
+			}
+
+			return runVerify(cmnd, opts)
 		},
 	}
 	opts.LoggingFlagOpts.ApplyFlags(command.Flags())
 	opts.SecureFlagOpts.ApplyFlags(command.Flags())
-	command.Flags().StringArrayVarP(&opts.pluginConfig, "plugin-config", "c", nil, "{key}={value} pairs that are passed as it is to a plugin, if the verification is associated with a verification plugin, refer plugin documentation to set appropriate values")
+	command.Flags().StringArrayVar(&opts.pluginConfig, "plugin-config", nil, "{key}={value} pairs that are passed as it is to a plugin, if the verification is associated with a verification plugin, refer plugin documentation to set appropriate values")
+	cmd.SetPflagUserMetadata(command.Flags(), &opts.userMetadata, cmd.PflagUserMetadataVerifyUsage)
+	cmd.SetPflagOutput(command.Flags(), &opts.outputFormat, cmd.PflagOutputUsage)
 	return command
 }
 
@@ -86,7 +101,13 @@ func runVerify(command *cobra.Command, opts *verifyOpts) error {
 	}
 
 	// set up verification plugin config.
-	configs, err := cmd.ParseFlagPluginConfig(opts.pluginConfig)
+	configs, err := cmd.ParseFlagMap(opts.pluginConfig, cmd.PflagPluginConfig.Name)
+	if err != nil {
+		return err
+	}
+
+	// set up user metadata
+	userMetadata, err := cmd.ParseFlagMap(opts.userMetadata, cmd.PflagUserMetadata.Name)
 	if err != nil {
 		return err
 	}
@@ -97,6 +118,7 @@ func runVerify(command *cobra.Command, opts *verifyOpts) error {
 		// TODO: need to change MaxSignatureAttempts as a user input flag or
 		// a field in config.json
 		MaxSignatureAttempts: math.MaxInt64,
+		UserMetadata:         userMetadata,
 	}
 
 	// core verify process
@@ -104,7 +126,7 @@ func runVerify(command *cobra.Command, opts *verifyOpts) error {
 	// write out on failure
 	if err != nil || len(outcomes) == 0 {
 		if err != nil {
-			var errorVerificationFailed *notation.ErrorVerificationFailed
+			var errorVerificationFailed notation.ErrorVerificationFailed
 			if !errors.As(err, &errorVerificationFailed) {
 				return fmt.Errorf("signature verification failed: %w", err)
 			}
@@ -122,12 +144,8 @@ func runVerify(command *cobra.Command, opts *verifyOpts) error {
 			fmt.Fprintf(os.Stderr, "Warning: %v was set to %q and failed with error: %v\n", result.Type, result.Action, result.Error)
 		}
 	}
-	if reflect.DeepEqual(outcome.VerificationLevel, trustpolicy.LevelSkip) {
-		fmt.Println("Trust policy is configured to skip signature verification for", ref.String())
-	} else {
-		fmt.Println("Successfully verified signature for", ref.String())
-	}
-	return nil
+
+	return printResult(opts.outputFormat, ref.String(), outcome)
 }
 
 func resolveReference(ctx context.Context, opts *SecureFlagOpts, reference string, sigRepo notationregistry.Repository, fn func(registry.Reference, ocispec.Descriptor)) (registry.Reference, error) {
@@ -147,4 +165,35 @@ func resolveReference(ctx context.Context, opts *SecureFlagOpts, reference strin
 	ref.Reference = manifestDesc.Digest.String()
 
 	return ref, nil
+}
+
+func printResult(outputFormat, reference string, outcome *notation.VerificationOutcome) error {
+	if reflect.DeepEqual(outcome.VerificationLevel, trustpolicy.LevelSkip) {
+		switch outputFormat {
+		case cmd.OutputJson:
+			output := verifyOutput{Reference: reference, Result: "SkippedByTrustPolicy", UserMetadata: map[string]string{}}
+			return ioutil.PrintObjectAsJSON(output)
+		default:
+			fmt.Println("Trust policy is configured to skip signature verification for", reference)
+			return nil
+		}
+	}
+
+	// the signature envelope is parsed as part of verification.
+	// since user metadata is only printed on successful verification,
+	// this error can be ignored
+	metadata, _ := outcome.UserMetadata()
+
+	switch outputFormat {
+	case cmd.OutputJson:
+		output := verifyOutput{Reference: reference, Result: "Success", UserMetadata: metadata}
+		return ioutil.PrintObjectAsJSON(output)
+	default:
+		fmt.Println("Successfully verified signature for", reference)
+		if len(metadata) > 0 {
+			fmt.Println("\nThe artifact was signed with the following user metadata.")
+			ioutil.PrintMetadataMap(os.Stdout, metadata)
+		}
+		return nil
+	}
 }
